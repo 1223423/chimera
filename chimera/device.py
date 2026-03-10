@@ -1,133 +1,197 @@
-import torch
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
 import psutil
+import torch
 
-def get_device(force_device=None):
-    """
-    Auto-detect optimal device: CUDA > MPS > CPU
 
-    Args:
-        force_device: Optional string to force specific device ('cuda', 'mps', 'cpu')
+BYTES_PER_GB = 1024 ** 3
 
-    Returns:
-        torch.device object
-    """
-    if force_device:
-        if force_device == 'cuda':
-            if torch.cuda.is_available():
-                print("> Using CUDA (forced)")
-                return torch.device("cuda")
-            else:
-                print("> CUDA not available, falling back to CPU")
-                return torch.device("cpu")
-        elif force_device == 'mps':
-            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-                print("> Using MPS (forced)")
-                return torch.device("mps")
-            else:
-                print("> MPS not available, falling back to CPU")
-                return torch.device("cpu")
-        else:
-            print("> Using CPU (forced)")
-            return torch.device("cpu")
 
-    # Auto-detect: CUDA > MPS > CPU
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"> CUDA detected ({gpu_name})")
-        return device
-    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        print("> MPS detected")
-        device = torch.device("mps")
-        return device
-    else:
-        print("> Using CPU")
+@dataclass(slots=True)
+class AcceleratorStatus:
+    key: str
+    label: str
+    available: bool
+
+
+@dataclass(slots=True)
+class MemoryBudget:
+    requested_bytes: int
+    total_budget_bytes: int
+    fragment_bytes: int
+    working_bytes: int
+
+
+def list_accelerators() -> list[AcceleratorStatus]:
+    return [
+        AcceleratorStatus("cuda", "CUDA", torch.cuda.is_available()),
+        AcceleratorStatus(
+            "mps",
+            "MPS",
+            torch.backends.mps.is_available() and torch.backends.mps.is_built(),
+        ),
+        AcceleratorStatus("cpu", "CPU", True),
+    ]
+
+
+def best_available_accelerator() -> AcceleratorStatus:
+    for status in list_accelerators():
+        if status.available:
+            return status
+    return AcceleratorStatus("cpu", "CPU", True)
+
+
+def resolve_device(requested: str = "auto") -> torch.device:
+    requested = requested.lower()
+
+    if requested == "auto":
+        return torch.device(best_available_accelerator().key)
+
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        raise RuntimeError("CUDA requested but not available.")
+
+    if requested == "mps":
+        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            return torch.device("mps")
+        raise RuntimeError("MPS requested but not available.")
+
+    if requested == "cpu":
         return torch.device("cpu")
 
-
-def get_available_memory():
-    """
-    Get available system memory in bytes
-
-    Returns:
-        int: Available memory in bytes
-    """
-    memory = psutil.virtual_memory()
-    return memory.available
+    raise ValueError(f"Unsupported device option: {requested}")
 
 
-def get_memory_limit(memory_fraction=0.5, verbose=True):
-    """
-    Calculate memory limit based on available memory and fraction to use
-
-    Args:
-        memory_fraction: Fraction of available memory to use (0.0-1.0)
-        verbose: Print information
-
-    Returns:
-        int: Memory limit in bytes
-    """
-    available = get_available_memory()
-    limit = int(available * memory_fraction)
-
-    if verbose:
-        print(f"> Available memory: {available / (1024**3):.2f} GB")
-        print(f"> Using {memory_fraction*100:.0f}% = {limit / (1024**3):.2f} GB for processing")
-
-    return limit
+def describe_device(device: torch.device) -> str:
+    if device.type == "cuda":
+        return "CUDA"
+    if device.type == "mps":
+        return "MPS"
+    return "CPU"
 
 
-def calculate_optimal_batch_size(memory_limit, fragment_size, n_fragments, device, verbose=True):
-    """
-    Calculate optimal batch size based on available memory
+def system_total_memory_bytes() -> int:
+    return int(psutil.virtual_memory().total)
 
-    Estimates memory per position and determines how many can fit in memory
 
-    Args:
-        memory_limit: Memory limit in bytes
-        fragment_size: Tuple of (width, height) for fragments
-        n_fragments: Number of fragments in library
-        device: torch.device object
-        verbose: Print information
+def system_available_memory_bytes() -> int:
+    return int(psutil.virtual_memory().available)
 
-    Returns:
-        int: Optimal batch size
-    """
-    # Estimate memory per position (fragment comparison operation)
-    bytes_per_element = 4  # float32
-    pixels_per_region = fragment_size[0] * fragment_size[1]
-    channels = 3  # LAB color space
 
-    # Memory for one region comparison with all fragments
-    memory_per_position = (
-        pixels_per_region * channels * bytes_per_element +  # region tensor
-        pixels_per_region * channels * n_fragments * bytes_per_element  # comparison arrays
+def system_total_memory_gb() -> float:
+    return system_total_memory_bytes() / BYTES_PER_GB
+
+
+def available_device_memory_bytes(device: torch.device) -> int:
+    if device.type == "cuda" and torch.cuda.is_available():
+        properties = torch.cuda.get_device_properties(0)
+        total = int(properties.total_memory)
+        reserved = int(torch.cuda.memory_reserved(0))
+        allocated = int(torch.cuda.memory_allocated(0))
+        used = max(reserved, allocated)
+        return max(total - used, BYTES_PER_GB)
+
+    return system_available_memory_bytes()
+
+
+def resolve_memory_budget(
+    device: torch.device,
+    memory_limit_gb: float,
+    fragment_bytes: int,
+) -> MemoryBudget:
+    if memory_limit_gb <= 0:
+        raise ValueError("memory_limit_gb must be > 0")
+
+    requested_bytes = int(memory_limit_gb * BYTES_PER_GB)
+    available_bytes = available_device_memory_bytes(device)
+    total_budget = min(requested_bytes, available_bytes)
+
+    safety_margin = int(total_budget * 0.12)
+    safe_budget = max(total_budget - safety_margin, BYTES_PER_GB)
+    working_bytes = max(safe_budget - fragment_bytes, 512 * 1024 * 1024)
+
+    return MemoryBudget(
+        requested_bytes=requested_bytes,
+        total_budget_bytes=safe_budget,
+        fragment_bytes=fragment_bytes,
+        working_bytes=working_bytes,
     )
 
-    # Conservative estimate: use 70% of limit for batch processing (rest for overhead)
-    usable_memory = memory_limit * 0.7
-    batch_size = int(usable_memory / memory_per_position)
 
-    # Ensure reasonable bounds
-    batch_size = max(100, min(batch_size, 50000))
+def format_bytes(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
 
-    if verbose:
-        if device.type in ["mps", "cuda"]:
-            print(f"> GPU batch size: {batch_size:,} positions")
-        else:
-            print(f"> CPU batch size: {batch_size:,} positions")
+    value = float(num_bytes)
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1024.0
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.2f} {unit}"
 
-    return batch_size
+    return f"{num_bytes} B"
 
 
-def clear_cache(device):
-    """
-    Clear device cache to free memory
-
-    Args:
-        device: torch.device object
-    """
+def choose_fragment_block_size(device: torch.device, requested: int | None) -> int:
+    if requested is not None:
+        return max(4, requested)
+    if device.type == "cuda":
+        return 32
     if device.type == "mps":
-        torch.mps.empty_cache()
-    elif device.type == "cuda":
+        return 16
+    return 8
+
+
+def choose_placement_batch_size(
+    working_bytes: int,
+    fragment_size: tuple[int, int],
+    fragment_block_size: int,
+    requested: int | None,
+    device: torch.device,
+) -> int:
+    if requested is not None:
+        return max(64, requested)
+
+    pixels = fragment_size[0] * fragment_size[1]
+    region_bytes = pixels * 7 * 4
+    pairwise_bytes = pixels * 3 * 2 * fragment_block_size
+    bytes_per_placement = max(region_bytes + pairwise_bytes, 1)
+
+    max_matching_bytes = max(int(working_bytes * 0.25), 64 * 1024 * 1024)
+    batch_size = max_matching_bytes // bytes_per_placement
+
+    if device.type == "cuda":
+        return max(256, min(batch_size, 4096))
+    if device.type == "mps":
+        return max(128, min(batch_size, 2048))
+    return max(64, min(batch_size, 1024))
+
+
+def choose_chunk_size_original(
+    source_size: tuple[int, int],
+    scaling: float,
+    working_bytes: int,
+    requested_chunk_size: int | None,
+) -> int:
+    bytes_per_scaled_pixel = 12
+    chunk_budget = max(int(working_bytes * 0.40), 128 * 1024 * 1024)
+    chunk_scaled_side = int(math.sqrt(chunk_budget / bytes_per_scaled_pixel))
+    computed_original = max(32, int(chunk_scaled_side / max(scaling, 1e-6)))
+
+    if requested_chunk_size is not None:
+        chunk_size = min(max(32, requested_chunk_size), computed_original)
+    else:
+        chunk_size = min(200, computed_original)
+
+    max_source_side = max(source_size[0], source_size[1])
+    return max(16, min(chunk_size, max_source_side))
+
+
+def clear_device_cache(device: torch.device) -> None:
+    if device.type == "cuda":
         torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()

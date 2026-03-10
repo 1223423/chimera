@@ -1,23 +1,22 @@
 [project]
 name = "chimera"
-version = "0.1.0"
-description = "Reconstruct a mosaic of a canvas image from any number of fragment images"
-authors = [
-    {name = "bencerne"}
-]
+version = "0.2.0"
+description = "GUI-first fragment mosaic renderer"
+authors = [{ name = "bencerne" }]
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [
-    "pillow (>=12.0.0,<13.0.0)",
-    "numpy (>=2.3.4,<3.0.0)",
-    "tqdm (>=4.67.1,<5.0.0)",
-    "scikit-image (>=0.25.2,<0.26.0)",
-    "torch (>=2.9.0,<3.0.0)",
-    "psutil (>=7.1.3,<8.0.0)",
-    "scikit-learn (>=1.7.2,<2.0.0)"
+    "numpy>=2.3.4,<3.0.0",
+    "pillow>=12.0.0,<13.0.0",
+    "psutil>=7.1.3,<8.0.0",
+    "PySide6>=6.10.2,<7.0.0",
+    "torch>=2.9.0,<3.0.0",
 ]
 
+[project.scripts]
+chimera = "chimera.main:main"
+chimera-cli = "chimera.cli:main"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"

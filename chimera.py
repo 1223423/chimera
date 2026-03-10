@@ -1,13 +1,4 @@
-"""
-Chimera - Mosaic Reconstruction
-
-This file provides backwards compatibility by importing from the chimera module.
-For new code, import from the chimera module directly.
-
-Usage:
-    python chimera.py [options]
-    python -m chimera.main [options]
-"""
+"""Launch the Chimera desktop app."""
 
 from chimera.main import main
 
